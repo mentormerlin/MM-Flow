@@ -1,375 +1,293 @@
 import React, { useCallback, useRef, useState } from 'react';
-import ReactFlow, {
-  ReactFlowProvider,
-  addEdge,
-  applyNodeChanges,
-  applyEdgeChanges,
-  ConnectionMode,
-  MarkerType,
+import { v4 as uuidv4 } from 'uuid';
+import {
   Node,
   Edge,
-  useNodesState,
-  useEdgesState,
-  Background,
-} from 'react-flow-renderer';
-import html2canvas from 'html2canvas';
-import jsPDF from 'jspdf';
-import { Document, Packer, Paragraph, Media } from 'docx';
-import { saveAs } from 'file-saver';
+  NodeChange,
+  EdgeChange,
+  Connection,
+  MarkerType,
+  Position,
+  applyNodeChanges,
+  applyEdgeChanges,
+} from 'reactflow';
 import Toolbar from './components/Toolbar';
+import FlowCanvas from './components/FlowCanvas';
 import Footer from './components/Footer';
-import { RectangleNode, CircleNode, DiamondNode, ArrowNode } from './components/nodes';
 
-// Mapping of node types to React components. React Flow will render
-// the appropriate component based on the node's `type` property.
-const nodeTypes = {
-  rectangleNode: RectangleNode,
-  circleNode: CircleNode,
-  diamondNode: DiamondNode,
-  arrowNode: ArrowNode,
-};
-
-// Helper type for storing history entries. Each entry consists of
-// deep copies of nodes and edges at a given point in time.
-interface HistoryEntry {
-  nodes: Node[];
-  edges: Edge[];
+// Utility function to generate a random position on the canvas. This
+// spreads new nodes out horizontally to avoid overlap. Feel free to
+// adjust the spread or use a more sophisticated layout algorithm.
+function randomPosition() {
+  const x = Math.random() * 600;
+  const y = Math.random() * 400;
+  return { x, y };
 }
 
-/**
- * The App component holds the top level state for nodes and edges,
- * manages undo/redo history, exports diagrams in multiple formats
- * and wires up the UI components (toolbar, canvas, footer). All
- * callbacks that mutate state push a new entry onto the history
- * stack unless triggered by an undo/redo operation.
- */
 const App: React.FC = () => {
-  // Node and edge state managed by React Flow hooks. The third value
-  // from useNodesState/useEdgesState is the built in change handler
-  // which applies modifications triggered by drag, resize and other
-  // interactions. We wrap these to capture history entries.
-  const [nodes, setNodes] = useNodesState<Node[]>([]);
-  const [edges, setEdges] = useEdgesState<Edge[]>([]);
-
-  // Reference to the DOM element containing the React Flow canvas. This
-  // is used when exporting diagrams to images or documents.
-  const reactFlowWrapper = useRef<HTMLDivElement>(null);
-
-  // React Flow instance is stored here once the graph initializes. It
-  // provides project(xy) which converts screen coordinates to graph
-  // coordinates used for placing dropped nodes.
-  const [reactFlowInstance, setReactFlowInstance] = useState<any>(null);
-
-  // History of node/edge states for undo/redo. Each entry stores
-  // serialisable copies of nodes and edges. We initialize with one
-  // empty state so that undo is disabled until at least one change.
-  const [history, setHistory] = useState<HistoryEntry[]>([{ nodes: [], edges: [] }]);
-  const [historyIndex, setHistoryIndex] = useState<number>(0);
-
-  // A ref used to temporarily disable history pushes during undo/redo
-  // operations to avoid recursive state updates.
-  const skipHistoryRef = useRef(false);
+  // Diagram state. Nodes and edges are stored in local state so that
+  // ReactFlow can render and update them. A small history stack
+  // enables undo/redo functionality.
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [edges, setEdges] = useState<Edge[]>([]);
+  // History for undo/redo. Each entry holds a snapshot of nodes and
+  // edges. When making a change, push the current state on history
+  // before applying the change. Undo pops from history and pushes
+  // onto redo; redo pops from redo and pushes back to history.
+  const historyRef = useRef<{ nodes: Node[]; edges: Edge[] }[]>([]);
+  const redoRef = useRef<{ nodes: Node[]; edges: Edge[] }[]>([]);
 
   /**
-   * Append a new history entry if history is not being skipped. This
-   * function slices the history array up to the current index and
-   * appends the new entry, discarding any 'redo' entries.
+   * Push the current diagram state onto the undo history. This
+   * function should be called immediately before applying a change to
+   * either nodes or edges.
    */
-  const pushHistory = useCallback(
-    (newNodes: Node[], newEdges: Edge[]) => {
-      if (skipHistoryRef.current) return;
-      setHistory((prev) => {
-        const historyPrefix = prev.slice(0, historyIndex + 1);
-        return [...historyPrefix, { nodes: JSON.parse(JSON.stringify(newNodes)), edges: JSON.parse(JSON.stringify(newEdges)) }];
-      });
-      setHistoryIndex((idx) => idx + 1);
-    },
-    [historyIndex]
-  );
+  const pushToHistory = useCallback(() => {
+    historyRef.current.push({
+      nodes: JSON.parse(JSON.stringify(nodes)),
+      edges: JSON.parse(JSON.stringify(edges)),
+    });
+    // Clear the redo stack on a new change
+    redoRef.current = [];
+  }, [nodes, edges]);
 
   /**
-   * Update handler for node changes triggered by React Flow. We wrap
-   * the built in applyNodeChanges to produce an updated array and
-   * record it in the history.
+   * Undo the last diagram change. Restores the previous nodes and
+   * edges from the history stack and pushes the current state on to
+   * the redo stack.
+   */
+  const handleUndo = useCallback(() => {
+    const last = historyRef.current.pop();
+    if (last) {
+      redoRef.current.push({ nodes, edges });
+      setNodes(last.nodes);
+      setEdges(last.edges);
+    }
+  }, [nodes, edges]);
+
+  /**
+   * Redo the most recently undone change. Pops a snapshot from the
+   * redo stack and pushes the current state back onto the history.
+   */
+  const handleRedo = useCallback(() => {
+    const next = redoRef.current.pop();
+    if (next) {
+      historyRef.current.push({ nodes, edges });
+      setNodes(next.nodes);
+      setEdges(next.edges);
+    }
+  }, [nodes, edges]);
+
+  /**
+   * Generic handler to apply node changes coming from ReactFlow. The
+   * applyNodeChanges utility merges the changes into the current
+   * nodes. Before applying, we push the current state onto the undo
+   * history.
    */
   const onNodesChange = useCallback(
-    (changes) => {
-      setNodes((nds) => {
-        const updatedNodes = applyNodeChanges(changes, nds);
-        pushHistory(updatedNodes, edges);
-        return updatedNodes;
-      });
+    (changes: NodeChange[]) => {
+      pushToHistory();
+      setNodes((nds) => applyNodeChanges(changes, nds));
     },
-    [edges, pushHistory]
+    [pushToHistory],
   );
 
   /**
-   * Update handler for edge changes. Similar to nodes, we apply
-   * changes and push to history.
+   * Generic handler to apply edge changes. Works analogously to
+   * onNodesChange.
    */
   const onEdgesChange = useCallback(
-    (changes) => {
-      setEdges((eds) => {
-        const updatedEdges = applyEdgeChanges(changes, eds);
-        pushHistory(nodes, updatedEdges);
-        return updatedEdges;
-      });
+    (changes: EdgeChange[]) => {
+      pushToHistory();
+      setEdges((eds) => applyEdgeChanges(changes, eds));
     },
-    [nodes, pushHistory]
+    [pushToHistory],
   );
 
   /**
-   * When a connection is made between two handles, add a new edge. We
-   * customise the marker to include an arrow and set its colour.
+   * Called when the user connects two handles. Creates a new edge
+   * connecting the source and target nodes. Edges are styled with
+   * Mentor Merlin colours and arrow heads. The current state is
+   * pushed onto the history before the update.
    */
   const onConnect = useCallback(
-    (params) => {
+    (connection: Connection) => {
+      pushToHistory();
       setEdges((eds) => {
+        const id = uuidv4();
         const newEdge: Edge = {
-          ...params,
-          id: `${params.source}-${params.target}-${Date.now()}`,
+          id,
+          source: connection.source!,
+          sourceHandle: connection.sourceHandle,
+          target: connection.target!,
+          targetHandle: connection.targetHandle,
           type: 'default',
-          markerEnd: { type: MarkerType.ArrowClosed, color: '#01579B' },
-          style: { stroke: '#01579B', strokeWidth: 2 },
-        } as Edge;
-        const updatedEdges = addEdge(newEdge, eds);
-        pushHistory(nodes, updatedEdges);
-        return updatedEdges;
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#003366' },
+          style: { stroke: '#003366', strokeWidth: 2 },
+        };
+        return [...eds, newEdge];
       });
     },
-    [nodes, pushHistory]
+    [pushToHistory],
   );
 
   /**
-   * Allow dropping of nodes onto the canvas. Retrieve the node type
-   * from the drag data, convert screen coords to graph coords and
-   * append a new node with the appropriate type and default data.
+   * Create a new node of the requested shape. Each node receives a
+   * unique identifier and a random position on the canvas. Its label
+   * defaults to the shape name but can be edited later. The current
+   * state is pushed to the history before the update.
    */
-  const onDrop = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const reactFlowBounds = reactFlowWrapper.current?.getBoundingClientRect();
-      const dataString = event.dataTransfer.getData('application/reactflow');
-      if (!dataString) return;
-      const { type } = JSON.parse(dataString);
-      if (!type) return;
-      if (!reactFlowBounds || !reactFlowInstance) return;
-      const position = reactFlowInstance.project({
-        x: event.clientX - reactFlowBounds.left,
-        y: event.clientY - reactFlowBounds.top,
-      });
-      const newNode: Node = {
-        id: `node_${Date.now()}`,
-        type,
-        position,
-        data: { label: '', onChangeLabel: handleLabelChange },
-      };
-      setNodes((nds) => nds.concat(newNode));
-      pushHistory([...nodes, newNode], edges);
-    },
-    [reactFlowInstance, nodes, edges, pushHistory]
-  );
-
-  /**
-   * Enable drag over the canvas. Without this handler the drop event
-   * will not fire. We set the dropEffect to 'move'.
-   */
-  const onDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'move';
-  }, []);
-
-  /**
-   * Called when the React Flow instance is first initialised. We store
-   * a reference so that we can convert screen coordinates to graph
-   * coordinates during drops.
-   */
-  const onInit = useCallback((flow: any) => {
-    setReactFlowInstance(flow);
-  }, []);
-
-  /**
-   * Update a node's label when edited. The node id and new value are
-   * passed from the Node component via data.onChangeLabel.
-   */
-  const handleLabelChange = useCallback(
-    (id: string, value: string) => {
+  const createNode = useCallback(
+    (shape: 'rectangle' | 'circle' | 'diamond') => {
+      pushToHistory();
       setNodes((nds) => {
-        const updatedNodes = nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, label: value, onChangeLabel: handleLabelChange } } : n));
-        pushHistory(updatedNodes, edges);
-        return updatedNodes;
+        const id = uuidv4();
+        const position = randomPosition();
+        const newNode: Node = {
+          id,
+          type: 'custom',
+          position,
+          data: { label: shape.charAt(0).toUpperCase() + shape.slice(1), shape },
+        };
+        return [...nds, newNode];
       });
     },
-    [edges, pushHistory]
+    [pushToHistory],
   );
 
   /**
-   * Undo the last operation by stepping one entry backwards in the
-   * history. History is not modified when moving within it; we only
-   * update the nodes/edges to the saved state.
+   * Update a node's label. Finds the node by id and replaces its
+   * label in the data. The current state is pushed to the history
+   * before updating.
    */
-  const undo = useCallback(() => {
-    if (historyIndex > 0) {
-      skipHistoryRef.current = true;
-      const newIndex = historyIndex - 1;
-      const state = history[newIndex];
-      setNodes(state.nodes.map((n) => ({ ...n, data: { ...n.data, onChangeLabel: handleLabelChange } })));
-      setEdges(state.edges);
-      setHistoryIndex(newIndex);
-      // re-enable history push after this call stack flushes
-      setTimeout(() => {
-        skipHistoryRef.current = false;
-      }, 0);
-    }
-  }, [history, historyIndex, handleLabelChange]);
+  const onNodeLabelChange = useCallback(
+    (id: string, label: string) => {
+      pushToHistory();
+      setNodes((nds) =>
+        nds.map((node) =>
+          node.id === id ? { ...node, data: { ...node.data, label } } : node,
+        ),
+      );
+    },
+    [pushToHistory],
+  );
 
   /**
-   * Redo the next operation by stepping one entry forwards in the
-   * history if it exists.
+   * Export the current diagram as a PNG. Uses the html-to-image
+   * library to rasterise the ReactFlow wrapper into a PNG data URI
+   * and then downloads it as a file. The promise chain is
+   * asynchronous to avoid loading both libraries on initial load.
    */
-  const redo = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      skipHistoryRef.current = true;
-      const newIndex = historyIndex + 1;
-      const state = history[newIndex];
-      setNodes(state.nodes.map((n) => ({ ...n, data: { ...n.data, onChangeLabel: handleLabelChange } })));
-      setEdges(state.edges);
-      setHistoryIndex(newIndex);
-      setTimeout(() => {
-        skipHistoryRef.current = false;
-      }, 0);
-    }
-  }, [history, historyIndex, handleLabelChange]);
+  const exportAsPng = useCallback(() => {
+    const flowWrapper = document.querySelector('.react-flow') as HTMLElement | null;
+    if (!flowWrapper) return;
+    import('html-to-image').then(({ toPng }) => {
+      toPng(flowWrapper).then((dataUrl: string) => {
+        const link = document.createElement('a');
+        link.download = 'diagram.png';
+        link.href = dataUrl;
+        link.click();
+      });
+    });
+  }, []);
 
   /**
-   * Export the current diagram as a PNG file. We capture the canvas
-   * element using html2canvas. The background is set to null so that
-   * transparent areas remain transparent.
+   * Export the diagram as a PDF. Converts the canvas to PNG and then
+   * writes it into a landscape PDF using jsPDF. The PDF dimensions
+   * match the canvas size.
    */
-  const exportPng = async () => {
-    if (!reactFlowWrapper.current) return;
-    const canvas = await html2canvas(reactFlowWrapper.current, { backgroundColor: null });
-    const dataUrl = canvas.toDataURL('image/png');
-    const link = document.createElement('a');
-    link.href = dataUrl;
-    link.download = 'diagram.png';
-    link.click();
-  };
+  const exportAsPdf = useCallback(() => {
+    const flowWrapper = document.querySelector('.react-flow') as HTMLElement | null;
+    if (!flowWrapper) return;
+    import('html-to-image').then(({ toPng }) => {
+      toPng(flowWrapper).then((dataUrl: string) => {
+        import('jspdf').then(({ default: jsPDF }) => {
+          const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [flowWrapper.clientWidth, flowWrapper.clientHeight] });
+          pdf.addImage(dataUrl, 'PNG', 0, 0, flowWrapper.clientWidth, flowWrapper.clientHeight);
+          pdf.save('diagram.pdf');
+        });
+      });
+    });
+  }, []);
 
   /**
-   * Export the current diagram as a PDF file. We capture the canvas
-   * using html2canvas and embed it directly into a jsPDF document.
+   * Export the diagram as a Word document (.docx). The diagram is
+   * rendered to PNG and then embedded into a document using the
+   * docx library. The resulting file is offered for download via
+   * Blob.
    */
-  const exportPdf = async () => {
-    if (!reactFlowWrapper.current) return;
-    const canvas = await html2canvas(reactFlowWrapper.current, { backgroundColor: '#FFFFFF' });
-    const imgData = canvas.toDataURL('image/png');
-    const pdf = new jsPDF('landscape', 'pt', [canvas.width, canvas.height]);
-    pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
-    pdf.save('diagram.pdf');
-  };
+  const exportAsDoc = useCallback(() => {
+    const flowWrapper = document.querySelector('.react-flow') as HTMLElement | null;
+    if (!flowWrapper) return;
+    import('html-to-image').then(({ toPng }) => {
+      toPng(flowWrapper).then((dataUrl: string) => {
+        import('docx').then(({ Document, Packer, Paragraph, ImageRun }) => {
+          const base64 = dataUrl.split(',')[1];
+          // Convert base64 to Uint8Array
+          const byteCharacters = atob(base64);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
 
-  /**
-   * Export the diagram as a DOCX document. We add the captured image
-   * into a docx file using the docx library. The file is saved via
-   * the FileSaver utility.
-   */
-  const exportDoc = async () => {
-    if (!reactFlowWrapper.current) return;
-    const canvas = await html2canvas(reactFlowWrapper.current, { backgroundColor: '#FFFFFF' });
-    const imgData = canvas.toDataURL('image/png');
-    const response = await fetch(imgData);
-    const blob = await response.blob();
-    const arrayBuffer = await blob.arrayBuffer();
-    const doc = new Document();
-    const image = Media.addImage(doc, arrayBuffer);
-    doc.addSection({ children: [new Paragraph(image)] });
-    const docBlob = await Packer.toBlob(doc);
-    saveAs(docBlob, 'diagram.docx');
-  };
-
-  /**
-   * Save the diagram as a JSON file containing the nodes and edges.
-   */
-  const saveDiagram = () => {
-    const dataStr = JSON.stringify({ nodes, edges }, null, 2);
-    const blob = new Blob([dataStr], { type: 'application/json' });
-    saveAs(blob, 'diagram.json');
-  };
-
-  /**
-   * Load a diagram from a user‑selected JSON file. The file should
-   * contain an object with `nodes` and `edges` properties. The
-   * onChangeLabel callback is restored on every node to ensure
-   * continued editability.
-   */
-  const loadDiagram = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const parsed = JSON.parse(event.target?.result as string);
-        if (parsed.nodes && parsed.edges) {
-          skipHistoryRef.current = true;
-          const loadedNodes: Node[] = parsed.nodes.map((n: any) => ({ ...n, data: { ...n.data, onChangeLabel: handleLabelChange } }));
-          const loadedEdges: Edge[] = parsed.edges;
-          setNodes(loadedNodes);
-          setEdges(loadedEdges);
-          setHistory([{ nodes: JSON.parse(JSON.stringify(loadedNodes)), edges: JSON.parse(JSON.stringify(loadedEdges)) }]);
-          setHistoryIndex(0);
-          setTimeout(() => {
-            skipHistoryRef.current = false;
-          }, 0);
-        }
-      } catch (err) {
-        console.error('Failed to load diagram:', err);
-      }
-    };
-    reader.readAsText(file);
-  };
+          const doc = new Document({});
+          const image = new ImageRun({
+            data: byteArray,
+            transformation: {
+              width: flowWrapper.clientWidth,
+              height: flowWrapper.clientHeight,
+            },
+          });
+          const paragraph = new Paragraph({ children: [image] });
+          doc.addSection({ children: [paragraph] });
+          Packer.toBlob(doc).then((blob: Blob) => {
+            const url = window.URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = 'diagram.docx';
+            anchor.click();
+            window.URL.revokeObjectURL(url);
+          });
+        });
+      });
+    });
+  }, []);
 
   return (
-    <ReactFlowProvider>
-      <div className="flex flex-col h-screen overflow-hidden">
-        {/* Toolbar at the top */}
+    <div className="flex flex-col h-screen">
+      {/* Header containing the toolbar and the Mentor Merlin logo */}
+      <header className="flex items-center justify-between p-2 bg-white shadow-sm">
         <Toolbar
-          onUndo={undo}
-          onRedo={redo}
-          onExportPng={exportPng}
-          onExportPdf={exportPdf}
-          onExportDoc={exportDoc}
-          onSave={saveDiagram}
-          onLoad={loadDiagram}
+          onAddRectangle={() => createNode('rectangle')}
+          onAddCircle={() => createNode('circle')}
+          onAddDiamond={() => createNode('diamond')}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          onExportPng={exportAsPng}
+          onExportPdf={exportAsPdf}
+          onExportDoc={exportAsDoc}
         />
-        {/* Canvas wrapper used for exporting */}
-        <div className="flex-1 relative bg-white" ref={reactFlowWrapper}>
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onInit={onInit}
-            onDrop={onDrop}
-            onDragOver={onDragOver}
-            nodeTypes={nodeTypes}
-            connectionMode={ConnectionMode.Loose}
-            fitView
-            deleteKeyCode={46}
-          >
-            {/* A grid background helps users align elements neatly */}
-            <Background gap={20} color="#E5E7EB" />
-          </ReactFlow>
-          {/* Branding logo in the upper right corner of the canvas */}
-          <img
-            src="/MM_logo.png"
-            alt="Mentor Merlin logo"
-            className="absolute top-2 right-2 w-28 h-auto pointer-events-none"
-          />
-        </div>
-        {/* Footer at the bottom with branding */}
-        <Footer />
-      </div>
-    </ReactFlowProvider>
+        <img
+          src={process.env.PUBLIC_URL + '/MM_logo.png'}
+          alt="Mentor Merlin logo"
+          className="h-10 w-auto"
+        />
+      </header>
+      {/* Main canvas area */}
+      <main className="flex-1 bg-gray-50 overflow-hidden">
+        <FlowCanvas
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          onNodeLabelChange={onNodeLabelChange}
+        />
+      </main>
+      {/* Footer with branding */}
+      <Footer />
+    </div>
   );
 };
 
